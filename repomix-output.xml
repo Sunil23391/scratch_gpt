@@ -1,0 +1,725 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.gitignore
+config.py
+docs/DATA_PROCESSING.md
+layers/attention/attention.md
+layers/attention/attention.py
+layers/attention/README.md
+layers/kv_cache/cache.md
+layers/kv_cache/cache.py
+layers/kv_cache/README.md
+layers/mlp/README.md
+layers/mlp/swiglu.md
+layers/mlp/swiglu.py
+layers/normalization/README.md
+layers/normalization/rms_norm.md
+layers/normalization/rms_norm.py
+layers/positional_emb/README.md
+layers/positional_emb/rope.md
+layers/positional_emb/rope.py
+model.py
+scripts/train_generic.py
+scripts/train_internal.py
+tests/test_components.py
+windows.README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path=".gitignore">
+.venv
+*.pyc
+</file>
+
+<file path="config.py">
+from dataclasses import dataclass
+
+@dataclass
+class Config:
+    vocab_size: int = 32000
+    dim: int = 2048
+    n_layers: int = 24
+    n_heads: int = 32
+    head_dim: int = 64  # dim // n_heads
+    hidden_dim: int = 5504 # Standard SwiGLU expansion
+    seq_len: int = 2048
+    batch_size: int = 8
+    lr: float = 1e-4
+    epochs: int = 10
+    gqa_groups: int = 1  # set >1 for grouped‑query attention
+    eps: float = 1e-6
+    rope_base: float = 10000.0
+</file>
+
+<file path="docs/DATA_PROCESSING.md">
+# Data Processing (BPE Tokenizer)
+
+The tokenizer follows the standard Byte‑Pair Encoding algorithm, optimized for multilingual support as seen in Qwen/Llama-3.
+
+## 1. Vocabulary Construction
+- Start from the byte‑level alphabet (256 symbols).
+- Iteratively merge the most frequent pair of symbols tokens in the training corpus.
+- Stop when the vocabulary size reaches `vocab_size`.
+
+## 2. Special Tokens
+- `<bos>` (begin‑of‑sentence): Marks the start of a prompt.
+- `<eos>` (end‑of‑sentence): Marks the completion of a sequence.
+- `<pad>`: Used to align batch sequences to the same length.
+- `<unk>`: Representing tokens not in the vocabulary (rare in modern BPE implementations but occasionally used).
+
+## 3. Encoding Pipeline
+1. **Normalization**: NFKC normalization or similar pre-processing.
+2. **Byte-Level Pre-tokenization**: Input text is UTF‑8 encoded and split into bytes.
+3. **BPE Merges**: The learned merges are applied to produce token IDs.
+
+## 4. Masking & Padding Strategy
+- **Causal Masking**: A triangular mask $M_{i,j}$ where $M_{i,j}=1$ if $j \le i$ and $0$ otherwise ensures that position $i$ can only attend to positions $1 \dots i$.
+- **Padding**: Sequences shorter than `seq_len` are padded. The attention mask should exclude padding tokens from being attended to.
+- **Truncation**: Sequences longer than `seq_len` are truncated to the maximum allowed length.
+</file>
+
+<file path="layers/attention/attention.md">
+# Multi-Head Attention Documentation
+
+**Component:** Multi‑Head Attention (MHA) with optional Grouped‑Query Attention (GQA)
+
+The attention mechanism computes a weighted sum of value vectors based on the similarity of query and key vectors:
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^{\top}}{\sqrt{d_k}}\right) V
+$$
+
+- $Q, K, V \in \mathbb{R}^{B \times S \times H \times d_k}$ where $B$ is batch size, $S$ sequence length, $H$ number of heads, $d_k$ head dimension.
+- For GQA, the number of query heads can differ from key/value heads; keys and values are shared across groups of queries.
+- The implementation uses a `KVCache` to store past keys and values for efficient autoregressive generation.
+
+**Shape Flow:**
+- Input: `[batch, seq_len, dim]`
+- Output: `[batch, seq_len, dim]`
+
+**Reference Implementation:** See `layers/attention/attention.py`.
+</file>
+
+<file path="layers/attention/attention.py">
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from layers.kv_cache.cache import KVCache
+
+class MultiHeadAttention(nn.Module):
+    """Multi‑Head Attention with optional Grouped‑Query Attention (GQA).
+    $$\text{Attention}(Q,K,V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
+    """
+    def __init__(self, dim: int, n_heads: int, head_dim: int, gqa_groups: int = 1):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.total_dim = n_heads * head_dim
+        self.gqa_groups = gqa_groups
+        # Projections
+        self.q_proj = nn.Linear(dim, self.total_dim, bias=False)
+        # For GQA, keys/values are shared across groups
+        self.k_proj = nn.Linear(dim, (n_heads // gqa_groups) * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, (n_heads // gqa_groups) * head_dim, bias=False)
+        self.out_proj = nn.Linear(self.total_dim, dim, bias=False)
+        self.kv_cache = KVCache()
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, use_cache: bool = False):
+        # x: [batch, seq_len, dim]
+        B, T, _ = x.shape
+        Q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)
+        K = self.k_proj(x).view(B, T, self.n_heads // self.gqa_groups, self.head_dim)
+        V = self.v_proj(x).view(B, T, self.n_heads // self.gqa_groups, self.head_dim)
+        if use_cache:
+            K, V = self.kv_cache.append(K, V)
+            
+        # For GQA, repeat KV heads to match number of query heads
+        if self.gqa_groups > 1:
+            # K shape: [B, S, n_kv_heads, D] -> [B, S, n_heads, D]
+            K = torch.repeat_interleave(K, self.gqa_groups, dim=2)
+            V = torch.repeat_interleave(V, self.gqa_groups, dim=2)
+            
+        # Compute scaled dot‑product attention
+        scores = torch.einsum('bthd,bshd->bths', Q, K) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+        attn = F.softmax(scores, dim=-1)
+        out = torch.einsum('bths,bshd->bthd', attn, V)
+        out = out.reshape(B, T, self.total_dim)
+        return self.out_proj(out)
+</file>
+
+<file path="layers/attention/README.md">
+# Attention Layer
+Contains the implementation of Multi-Head Attention (MHA) and Grouped-Query Attention (GQA).
+
+## Files
+- `attention.py`: PyTorch implementation.
+- `attention.md`: Mathematical documentation with LaTeX formulas.
+</file>
+
+<file path="layers/kv_cache/cache.md">
+# KV-Cache Documentation
+
+**Component:** KV‑Cache (Key‑Value Cache)
+
+The KV‑Cache stores previously computed key and value tensors during autoregressive generation, allowing the model to reuse past attention computations without recomputing them.
+
+- `append(k, v)` adds new key/value tensors (shape `[batch, seq_len, heads, head_dim]`) to the cache and returns the concatenated tensors along the sequence dimension.
+- `reset()` clears the cache, typically called at the start of a new generation sequence.
+
+**Shape Flow:**
+- Input to `append`: `k` and `v` of shape `[batch, seq_len, heads, head_dim]`
+- Output from `append`: concatenated `K` and `V` of shape `[batch, total_seq_len, heads, head_dim]`
+
+**Reference Implementation:** See `layers/kv_cache/cache.py`.
+</file>
+
+<file path="layers/kv_cache/cache.py">
+import torch
+
+class KVCache:
+    """Simple static/rolling KV cache for autoregressive inference.
+    Stores past keys and values and concatenates new ones.
+    """
+    def __init__(self):
+        self.keys = []
+        self.values = []
+
+    def append(self, k: torch.Tensor, v: torch.Tensor):
+        """Append new keys and values.
+        Args:
+            k: Tensor of shape [batch, seq_len, heads, head_dim]
+            v: Tensor of shape [batch, seq_len, heads, head_dim]
+        Returns:
+            Concatenated keys and values along sequence dimension.
+        """
+        self.keys.append(k)
+        self.values.append(v)
+        K = torch.cat(self.keys, dim=1)  # concat on sequence dim
+        V = torch.cat(self.values, dim=1)
+        return K, V
+
+    def reset(self):
+        """Clear the cache (e.g., at start of new generation)."""
+        self.keys.clear()
+        self.values.clear()
+</file>
+
+<file path="layers/kv_cache/README.md">
+# KV Cache
+Contains the Key-Value Cache management for autoregressive inference.
+
+## Files
+- `cache.py`: PyTorch implementation.
+- `cache.md`: Mathematical documentation with LaTeX formulas.
+</file>
+
+<file path="layers/mlp/README.md">
+# MLP Layer
+Contains the SwiGLU activation and feed-forward network components.
+
+## Files
+- `swiglu.py`: PyTorch implementation.
+- `swiglu.md`: Mathematical documentation with LaTeX formulas.
+</file>
+
+<file path="layers/mlp/swiglu.md">
+# SwiGLU Documentation
+
+**Component:** SwiGLU (SwiGLU Activation)
+
+The SwiGLU activation is embedded in an MLP block that uses three weight matrices:
+
+$$
+\text{MLP}(x) = (\text{SiLU}(xW_1) \otimes xW_3)W_2
+$$
+
+- $x \in \mathbb{R}^{B \times S \times d}$ is the input tensor.
+- $W_1, W_3 \in \mathbb{R}^{d \times h}$ are up‑projection matrices.
+- $W_2 \in \mathbb{R}^{h \times d}$ is the down‑projection matrix.
+- $\text{SiLU}$ is the Sigmoid‑Linear Unit activation.
+- The element‑wise product $\otimes$ is applied between the gated path and the up‑projection path.
+
+**Shape Flow:**
+- Input: `[batch, seq_len, dim]`
+- Output: `[batch, seq_len, hidden_dim]`
+
+**Reference Implementation:** See `layers/mlp/swiglu.py`.
+</file>
+
+<file path="layers/mlp/swiglu.py">
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SwiGLU(nn.Module):
+    """SwiGLU activation and MLP block using three weight matrices.
+    $$\text{MLP}(x) = (\text{SiLU}(xW_1) \otimes xW_3)W_2$$
+    where $W_1, W_3$ are up-projections and $W_2$ is a down-projection.
+    """
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False) # Gate
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False) # Down
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False) # Up
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq_len, dim]
+        gate = F.silu(self.w1(x))          # [b, s, h]
+        up = self.w3(x)                    # [b, s, h]
+        out = self.w2(gate * up)           # [b, s, dim]
+        return out
+</file>
+
+<file path="layers/normalization/README.md">
+# Normalization Layer
+Contains Root Mean Square Layer Normalization (RMSNorm).
+
+## Files
+- `rms_norm.py`: PyTorch implementation.
+- `rms_norm.md`: Mathematical documentation with LaTeX formulas.
+</file>
+
+<file path="layers/normalization/rms_norm.md">
+# RMSNorm Documentation
+
+**Component:** RMSNorm (Root Mean Square Layer Normalization)
+
+The RMSNorm operation normalizes the input tensor $x$ by its root-mean-square (RMS) value and then scales it with a learnable gain $g$:
+
+$$
+\text{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{d}\sum_{i=1}^{d} x_i^2 + \epsilon}} \cdot g
+$$
+
+- $x \in \mathbb{R}^{B \times S \times d}$ where $B$ is batch size, $S$ sequence length, $d$ hidden dimension.
+- $\epsilon$ is a small constant for numerical stability (default $1\times10^{-6}$).
+- $g \in \mathbb{R}^{d}$ is a learnable parameter initialized to ones.
+
+**Shape Flow:**
+- Input: `[batch, seq_len, dim]`
+- Output: `[batch, seq_len, dim]`
+
+**Reference Implementation:** See `layers/normalization/rms_norm.py`.
+</file>
+
+<file path="layers/normalization/rms_norm.py">
+import torch
+import torch.nn as nn
+
+class RMSNorm(nn.Module):
+    """Root‑Mean‑Square Layer Normalization (pre‑norm).
+    $$\text{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{d}\sum_{i=1}^{d} x_i^2 + \epsilon}} \cdot g$$
+    where $g \in \mathbb{R}^d$ is a learnable gain.
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq_len, dim]
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        return (x / rms) * self.weight
+</file>
+
+<file path="layers/positional_emb/README.md">
+# Positional Embeddings
+Contains Rotary Positional Embeddings (RoPE).
+
+## Files
+- `rope.py`: PyTorch implementation.
+- `rope.md`: Mathematical documentation with LaTeX formulas.
+</file>
+
+<file path="layers/positional_emb/rope.md">
+# RoPE Documentation
+
+**Component:** RoPE (Rotary Positional Embedding)
+
+RoPE rotates query and key vectors in the complex plane based on their position in the sequence. For a given dimension $d$, the rotation matrix for position $t$ is:
+
+$$
+\mathbf{R}_{\theta_t} = \begin{bmatrix}\cos(\theta_t) & -\sin(\theta_t)\\ \sin(\theta_t) & \cos(\theta_t)\end{bmatrix},
+\quad \theta_t = t \cdot \omega,
+$$
+where $\omega$ is a frequency vector derived from the inverse frequency buffer.
+
+The implementation computes cosine and sine embeddings for each position, views the hidden states as complex numbers via `torch.view_as_complex`, and applies the rotation efficiently without extra memory allocations.
+
+**Shape Flow:**
+- Input: `[batch, seq_len, n_heads, head_dim]`
+- Output: `[batch, seq_len, n_heads, head_dim]`
+
+**Reference Implementation:** See `layers/positional_emb/rope.py`.
+</file>
+
+<file path="layers/positional_emb/rope.py">
+import torch
+import torch.nn as nn
+import math
+
+class RoPE(nn.Module):
+    """Rotary Positional Embedding using complex view.
+    $$\mathbf{R}_{\theta} = \begin{bmatrix}\cos\theta & -\sin\theta\\ \sin\theta & \cos\theta\end{bmatrix}$$
+    """
+    def __init__(self, dim: int, base: float = 10000.0, scale: float = 1.0):
+        super().__init__()
+        self.dim = dim
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq * scale)
+
+    def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
+        # x: [batch, seq_len, n_heads, head_dim]
+        # inv_freq: [head_dim / 2]
+        t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+        # freqs: [seq_len, head_dim / 2]
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        
+        # View x as complex
+        # x_complex: [batch, seq_len, n_heads, head_dim / 2]
+        x_complex = torch.view_as_complex(x.reshape(*x.shape[:-1], -1, 2))
+        
+        # Create rotation tensor in complex space
+        # rot: [seq_len, head_dim / 2]
+        # We need it as [1, seq_len, 1, head_dim / 2] for broadcasting
+        rot = torch.polar(torch.ones_like(freqs), freqs)
+        rot = rot[None, :, None, :]
+        
+        # Apply rotation
+        x_rot = x_complex * rot
+        
+        # Return as real tensor
+        return torch.view_as_real(x_rot).reshape_as(x)
+</file>
+
+<file path="model.py">
+import torch
+import torch.nn as nn
+from layers.normalization.rms_norm import RMSNorm
+from layers.mlp.swiglu import SwiGLU
+from layers.attention.attention import MultiHeadAttention
+from layers.positional_emb.rope import RoPE
+
+class ScratchTransformerModel(nn.Module):
+    """Main Scratch Transformer assembly combining all modular layers."""
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.dim)
+        
+        # Pre-normalization before the transformer blocks
+        self.initial_norm = RMSNorm(cfg.dim, eps=cfg.eps)
+        
+        # Shared RoPE buffer
+        self.rope = RoPE(cfg.head_dim, base=cfg.rope_base)
+        
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                "attention_norm": RMSNorm(cfg.dim, eps=cfg.eps),
+                "attention": MultiHeadAttention(cfg.dim, cfg.n_heads, cfg.head_dim, cfg.gqa_groups),
+                "mlp_norm": RMSNorm(cfg.dim, eps=cfg.eps),
+                "mlp": SwiGLU(cfg.dim, cfg.hidden_dim),
+            })
+            for _ in range(cfg.n_layers)
+        ])
+        
+        self.final_norm = RMSNorm(cfg.dim, eps=cfg.eps)
+        self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+
+    def forward(self, idx: torch.Tensor):
+        # idx: [batch, seq_len]
+        batch, seq_len = idx.shape
+        
+        # Word embeddings
+        # x: [batch, seq_len, dim]
+        x = self.embed(idx)
+        x = self.initial_norm(x)
+        
+        for layer in self.layers:
+            # Attention block (Pre-norm)
+            # x_attn_norm: [batch, seq_len, dim]
+            x_attn_norm = layer["attention_norm"](x)
+            attn_out = layer["attention"](x_attn_norm)
+            x = x + attn_out
+            
+            # MLP block (Pre-norm)
+            # x_mlp_norm: [batch, seq_len, dim]
+            x_mlp_norm = layer["mlp_norm"](x)
+            mlp_out = layer["mlp"](x_mlp_norm)
+            x = x + mlp_out
+            
+        # Final output normalization and projection
+        # x: [batch, seq_len, dim]
+        x = self.final_norm(x)
+        logits = self.lm_head(x) # [batch, seq_len, vocab_size]
+        
+        return logits
+</file>
+
+<file path="scripts/train_generic.py">
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.amp import autocast, GradScaler
+from model import ScratchTransformerModel
+from config import Config
+
+def setup(rank, world_size):
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
+
+def train(rank, world_size, cfg):
+    setup(rank, world_size)
+    
+    # Set device
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    
+    # Initialize model and wrap with DDP
+    model = ScratchTransformerModel(cfg).to(device)
+    model = DDP(model, device_ids=[rank])
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    scaler = GradScaler() # For mixed precision
+    
+    # Placeholder for actual distributed DataLoader (e.g., from S3 or large local dataset)
+    # loader = ... 
+    
+    model.train()
+    # Training Loop
+    for epoch in range(cfg.epochs):
+        # for batch in loader:
+        #     optimizer.zero_grad()
+        #     with autocast(device_type='cuda', dtype=torch.float16):
+        #         inputs = batch[:, :-1].to(device)
+        #         targets = batch[:, 1:].to(device)
+        #         logits = model(inputs)
+        #         loss = torch.nn.functional.cross_entropy(
+        #             logits.reshape(-1, cfg.vocab_size), 
+        #             targets.reshape(-1)
+        #         )
+        #     
+        #     scaler.scale(loss).backward()
+        #     scaler.step(optimizer)
+        #     scaler.update()
+        
+        if rank == 0:
+            print(f"Rank {rank} | Epoch {epoch+1} completed placeholder")
+
+    cleanup()
+
+if __name__ == "__main__":
+    cfg = Config()
+    world_size = torch.cuda.device_count()
+    if world_size > 1:
+        torch.multiprocessing.spawn(
+            train,
+            args=(world_size, cfg),
+            nprocs=world_size,
+            join=True
+        )
+    else:
+        print("Distributed training requires at least 2 GPUs. Skipping DDP spawn.")
+</file>
+
+<file path="scripts/train_internal.py">
+import torch
+import os
+from torch.utils.data import DataLoader, TensorDataset
+from model import ScratchTransformerModel
+from config import Config
+
+def main():
+    # Load configuration
+    cfg = Config(
+        dim=128, 
+        n_layers=2, 
+        n_heads=4, 
+        hidden_dim=256,
+        batch_size=4,
+        epochs=5
+    )
+    
+    # Initialize model
+    model = ScratchTransformerModel(cfg)
+    print(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters.")
+    
+    # Mock data generation
+    # simulating a .pt file with tokenized data
+    mock_data_path = "mock_data.pt"
+    if not os.path.exists(mock_data_path):
+        data = torch.randint(0, cfg.vocab_size, (16, cfg.seq_len))
+        torch.save(data, mock_data_path)
+    
+    data = torch.load(mock_data_path)
+    dataset = TensorDataset(data)
+    loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    criterion = torch.nn.CrossEntropyLoss()
+    
+    model.train()
+    for epoch in range(cfg.epochs):
+        total_loss = 0
+        for i, (batch,) in enumerate(loader):
+            # Input: tokens [0 to N-1], Target: tokens [1 to N]
+            inputs = batch[:, :-1]
+            targets = batch[:, 1:]
+            
+            logits = model(inputs)
+            
+            # Flatten for cross-entropy
+            loss = criterion(logits.reshape(-1, cfg.vocab_size), targets.reshape(-1))
+            
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            
+            total_loss += loss.item()
+            
+        avg_loss = total_loss / len(loader)
+        print(f"Epoch {epoch+1}/{cfg.epochs} | Avg Loss: {avg_loss:.4f}")
+
+    # Cleanup mock data
+    if os.path.exists(mock_data_path):
+        os.remove(mock_data_path)
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="tests/test_components.py">
+import torch
+import torch.nn as nn
+from layers.normalization.rms_norm import RMSNorm
+from layers.mlp.swiglu import SwiGLU
+from layers.positional_emb.rope import RoPE
+from layers.attention.attention import MultiHeadAttention
+from layers.kv_cache.cache import KVCache
+from model import ScratchTransformerModel
+from config import Config
+
+def test_rms_norm():
+    print("Testing RMSNorm...")
+    dim = 64
+    norm = RMSNorm(dim)
+    x = torch.randn(2, 10, dim)
+    out = norm(x)
+    assert out.shape == x.shape, f"Expected {x.shape}, got {out.shape}"
+    # RMSNorm should keep mean squared equal to 1 (approx) before scaling
+    # We just check shape and lack of NaNs here
+    assert not torch.isnan(out).any(), "NaNs detected in RMSNorm"
+    print("RMSNorm passed.")
+
+def test_swiglu():
+    print("Testing SwiGLU...")
+    dim, hidden_dim = 64, 128
+    mlp = SwiGLU(dim, hidden_dim)
+    x = torch.randn(2, 10, dim)
+    out = mlp(x)
+    assert out.shape == (2, 10, dim), f"Expected (2, 10, {dim}), got {out.shape}"
+    assert not torch.isnan(out).any(), "NaNs detected in SwiGLU"
+    print("SwiGLU passed.")
+
+def test_rope():
+    print("Testing RoPE...")
+    head_dim = 64
+    rope = RoPE(head_dim)
+    x = torch.randn(2, 10, 8, head_dim) # [batch, seq, heads, dim]
+    out = rope(x, seq_len=10)
+    assert out.shape == x.shape, f"Expected {x.shape}, got {out.shape}"
+    assert not torch.isnan(out).any(), "NaNs detected in RoPE"
+    print("RoPE passed.")
+
+def test_attention_and_cache():
+    print("Testing MultiHeadAttention and KVCache...")
+    dim, n_heads, head_dim = 64, 4, 16
+    attn = MultiHeadAttention(dim, n_heads, head_dim, gqa_groups=2)
+    x = torch.randn(2, 1, dim) # Single token
+    out = attn(x, use_cache=True)
+    assert out.shape == (2, 1, dim), f"Expected (2, 1, {dim}), got {out.shape}"
+    
+    # Check cache
+    assert len(attn.kv_cache.keys) == 1
+    assert attn.kv_cache.keys[0].shape == (2, 1, 2, head_dim) # GQA groups = 2
+    
+    # Second token
+    out2 = attn(x, use_cache=True)
+    assert out2.shape == (2, 1, dim)
+    assert len(attn.kv_cache.keys) == 2
+    
+    attn.kv_cache.reset()
+    assert len(attn.kv_cache.keys) == 0
+    print("Attention and KVCache passed.")
+
+def test_model():
+    print("Testing ScratchTransformerModel...")
+    cfg = Config(dim=64, n_layers=2, n_heads=4, head_dim=16, hidden_dim=128)
+    model = ScratchTransformerModel(cfg)
+    idx = torch.randint(0, cfg.vocab_size, (2, 10))
+    logits = model(idx)
+    assert logits.shape == (2, 10, cfg.vocab_size), f"Expected (2, 10, {cfg.vocab_size}), got {logits.shape}"
+    assert not torch.isnan(logits).any(), "NaNs detected in Model output"
+    print("ScratchTransformerModel passed.")
+
+if __name__ == "__main__":
+    test_rms_norm()
+    test_swiglu()
+    test_rope()
+    test_attention_and_cache()
+    test_model()
+    print("\nAll unit tests passed successfully!")
+</file>
+
+<file path="windows.README.md">
+## Commands to test 
+python -m tests.test_components
+</file>
+
+</files>

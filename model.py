@@ -24,8 +24,7 @@ class ScratchTransformerModel(nn.Module):
                 "attention": MultiHeadAttention(cfg.dim, cfg.n_heads, cfg.head_dim, cfg.gqa_groups),
                 "mlp_norm": RMSNorm(cfg.dim, eps=cfg.eps),
                 "mlp": SwiGLU(cfg.dim, cfg.hidden_dim),
-            })
-            for _ in range(cfg.n_layers)
+            }) for _ in range(cfg.n_layers)
         ])
         
         self.final_norm = RMSNorm(cfg.dim, eps=cfg.eps)
@@ -44,7 +43,7 @@ class ScratchTransformerModel(nn.Module):
             # Attention block (Pre-norm)
             # x_attn_norm: [batch, seq_len, dim]
             x_attn_norm = layer["attention_norm"](x)
-            attn_out = layer["attention"](x_attn_norm)
+            attn_out = layer["attention"](x_attn_norm, rope=self.rope) # <-- RoPE applied here
             x = x + attn_out
             
             # MLP block (Pre-norm)

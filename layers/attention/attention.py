@@ -22,12 +22,19 @@ class MultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(self.total_dim, dim, bias=False)
         self.kv_cache = KVCache()
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, use_cache: bool = False):
+    def forward(self, x: torch.Tensor, rope: nn.Module = None, mask: torch.Tensor = None, use_cache: bool = False):
         # x: [batch, seq_len, dim]
         B, T, _ = x.shape
         Q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)
         K = self.k_proj(x).view(B, T, self.n_heads // self.gqa_groups, self.head_dim)
         V = self.v_proj(x).view(B, T, self.n_heads // self.gqa_groups, self.head_dim)
+
+        # --- APPLY RoPE HERE ---
+        if rope is not None:
+            Q = rope(Q, T)
+            K = rope(K, T)
+        # -----------------------
+
         if use_cache:
             K, V = self.kv_cache.append(K, V)
             
