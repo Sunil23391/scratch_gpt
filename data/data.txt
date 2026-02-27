@@ -1,0 +1,3 @@
+The quick brown fox jumps over the lazy dog. 
+Transformers are powerful models for natural language processing.
+This is a simple dataset to train the ScratchTransformer.
